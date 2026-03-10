@@ -4,3 +4,7 @@ __pycache__/
 venv/
 .prod/
 .DS_Store
+*.pkl
+*.joblib
+models/
+data/
