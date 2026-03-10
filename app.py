@@ -1,24 +1,24 @@
-import joblib
+import os
 import json
 import pickle
+import joblib
 import pandas as pd
 from flask import Flask, jsonify, request
 from peewee import (
-    SqliteDatabase, PostgresqlDatabase, Model, IntegerField,
-    FloatField, TextField, IntegrityError
+    Model, IntegerField, FloatField,
+    TextField, IntegrityError
 )
 from playhouse.shortcuts import model_to_dict
-import os
 from playhouse.db_url import connect
-
-
 
 
 ########################################
 # Begin database stuff
 
-# DB = SqliteDatabase('predictions.db')
-DB = connect(os.environ.get('DATABASE_URL'))
+# The connect function checks if there is a DATABASE_URL env var.
+# If it exists, it uses it to connect to a remote postgres db.
+# Otherwise, it connects to a local sqlite db stored in predictions.db.
+DB = connect(os.environ.get('DATABASE_URL') or 'sqlite:///predictions.db')
 
 class Prediction(Model):
     observation_id = IntegerField(unique=True)
@@ -42,12 +42,10 @@ DB.create_tables([Prediction], safe=True)
 with open('columns.json') as fh:
     columns = json.load(fh)
 
+pipeline = joblib.load('pipeline.pickle')
 
 with open('dtypes.pickle', 'rb') as fh:
     dtypes = pickle.load(fh)
-
-
-pipeline = joblib.load('pipeline.pickle')
 
 
 # End model un-pickling
@@ -62,10 +60,15 @@ app = Flask(__name__)
 
 @app.route('/predict', methods=['POST'])
 def predict():
+    # Flask provides a deserialization convenience function called
+    # get_json that will work if the mimetype is application/json.
     obs_dict = request.get_json()
     _id = obs_dict['id']
     observation = obs_dict['observation']
+    # Now do what we already learned in the notebooks about how to transform
+    # a single observation into a dataframe that will work with a pipeline.
     obs = pd.DataFrame([observation], columns=columns).astype(dtypes)
+    # Now get ourselves an actual prediction of the positive class.
     proba = pipeline.predict_proba(obs)[0, 1]
     response = {'proba': proba}
     p = Prediction(
@@ -76,11 +79,12 @@ def predict():
     try:
         p.save()
     except IntegrityError:
-        error_msg = "ERROR: Observation ID: '{}' already exists".format(_id)
-        response["error"] = error_msg
+        error_msg = f'Observation ID {_id} already exists'
+        response['error'] = error_msg
         print(error_msg)
         DB.rollback()
     return jsonify(response)
+
 
 @app.route('/update', methods=['POST'])
 def update():
@@ -91,11 +95,20 @@ def update():
         p.save()
         return jsonify(model_to_dict(p))
     except Prediction.DoesNotExist:
-        error_msg = 'Observation ID: "{}" does not exist'.format(obs['id'])
+        error_msg = f'Observation ID {obs['id']} does not exist'
         return jsonify({'error': error_msg})
+
+
+@app.route('/list-db-contents')
+def list_db_contents():
+    return jsonify([
+        model_to_dict(obs) for obs in Prediction.select()
+    ])
+
 
 # End webserver stuff
 ########################################
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host='0.0.0.0', debug=True, port=5000)
+
