@@ -8,13 +8,17 @@ from peewee import (
     FloatField, TextField, IntegrityError
 )
 from playhouse.shortcuts import model_to_dict
+import os
+from playhouse.db_url import connect
+
+
 
 
 ########################################
 # Begin database stuff
 
-DB = SqliteDatabase('predictions.db')
-
+# DB = SqliteDatabase('predictions.db')
+DB = connect(os.environ.get('DATABASE_URL'))
 
 class Prediction(Model):
     observation_id = IntegerField(unique=True)
