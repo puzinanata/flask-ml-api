@@ -67,14 +67,18 @@ def predict():
     observation = obs_dict['observation']
     # Now do what we already learned in the notebooks about how to transform
     # a single observation into a dataframe that will work with a pipeline.
-    obs = pd.DataFrame([observation], columns=columns).astype(dtypes)
-    # Now get ourselves an actual prediction of the positive class.
-    proba = pipeline.predict_proba(obs)[0, 1]
+    try:
+        obs = pd.DataFrame([observation], columns=columns).astype(dtypes)
+        # Now get ourselves an actual prediction of the positive class.
+        proba = float(pipeline.predict_proba(obs)[0, 1])
+    except Exception:
+        return jsonify({"error": "Observation is invalid!"})
+
     response = {'proba': proba}
     p = Prediction(
         observation_id=_id,
         proba=proba,
-        observation=request.data
+        observation=json.dumps(observation)
     )
     try:
         p.save()
@@ -82,7 +86,6 @@ def predict():
         error_msg = f'Observation ID {_id} already exists'
         response['error'] = error_msg
         print(error_msg)
-        DB.rollback()
     return jsonify(response)
 
 
@@ -95,7 +98,7 @@ def update():
         p.save()
         return jsonify(model_to_dict(p))
     except Prediction.DoesNotExist:
-        error_msg = f'Observation ID {obs['id']} does not exist'
+        error_msg = f"Observation ID {obs['id']} does not exist"
         return jsonify({'error': error_msg})
 
 
@@ -110,5 +113,4 @@ def list_db_contents():
 ########################################
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', debug=True, port=5000)
-
+    app.run(host='0.0.0.0', debug=True, port=5001)
