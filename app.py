@@ -15,14 +15,13 @@ from playhouse.db_url import connect
 ########################################
 # Begin database stuff
 
-# The connect function checks if there is a DATABASE_URL env var.
-# If it exists, it uses it to connect to a remote postgres db.
-# Otherwise, it connects to a local sqlite db stored in predictions.db.
-DB = connect(os.environ.get('DATABASE_URL') or 'sqlite:///predictions.db')
+DB = connect(os.environ.get("DATABASE_URL") or "sqlite:///predictions.db")
+
 
 class Prediction(Model):
-    observation_id = IntegerField(unique=True)
+    observation_id = TextField(unique=True)
     observation = TextField()
+    prediction = IntegerField()
     proba = FloatField()
     true_class = IntegerField(null=True)
 
@@ -30,6 +29,7 @@ class Prediction(Model):
         database = DB
 
 
+DB.connect(reuse_if_open=True)
 DB.create_tables([Prediction], safe=True)
 
 # End database stuff
@@ -38,15 +38,13 @@ DB.create_tables([Prediction], safe=True)
 ########################################
 # Unpickle the previously-trained model
 
-
-with open('columns.json') as fh:
+with open("columns.json") as fh:
     columns = json.load(fh)
 
-pipeline = joblib.load('pipeline.pickle')
+pipeline = joblib.load("pipeline.pickle")
 
-with open('dtypes.pickle', 'rb') as fh:
+with open("dtypes.pickle", "rb") as fh:
     dtypes = pickle.load(fh)
-
 
 # End model un-pickling
 ########################################
@@ -58,64 +56,122 @@ with open('dtypes.pickle', 'rb') as fh:
 app = Flask(__name__)
 
 
-@app.route('/predict', methods=['POST'])
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"status": "ok"})
+
+
+@app.route("/predict", methods=["POST"])
 def predict():
-    # Flask provides a deserialization convenience function called
-    # get_json that will work if the mimetype is application/json.
-    obs_dict = request.get_json()
-    _id = obs_dict['id']
-    observation = obs_dict['observation']
-    # Now do what we already learned in the notebooks about how to transform
-    # a single observation into a dataframe that will work with a pipeline.
+    obs_dict = request.get_json(silent=True)
+
+    if not isinstance(obs_dict, dict):
+        return jsonify({
+            "observation_id": None,
+            "error": "Invalid JSON payload"
+        }), 400
+
+    if "observation_id" not in obs_dict:
+        return jsonify({
+            "observation_id": None,
+            "error": "Missing field: observation_id"
+        }), 400
+
+    observation_id = obs_dict["observation_id"]
+
+    if "data" not in obs_dict:
+        return jsonify({
+            "observation_id": observation_id,
+            "error": "Missing field: data"
+        }), 400
+
+    observation = obs_dict["data"]
+
+    if not isinstance(observation, dict):
+        return jsonify({
+            "observation_id": observation_id,
+            "error": "Field 'data' must be a dictionary"
+        }), 400
+
     try:
         obs = pd.DataFrame([observation], columns=columns).astype(dtypes)
-        # Now get ourselves an actual prediction of the positive class.
-        proba = float(pipeline.predict_proba(obs)[0, 1])
+        prediction = bool(pipeline.predict(obs)[0])
+        probability = float(pipeline.predict_proba(obs)[0, 1])
     except Exception:
-        return jsonify({"error": "Observation is invalid!"})
+        return jsonify({
+            "observation_id": observation_id,
+            "error": "Observation is invalid!"
+        }), 400
 
-    response = {
-    "id": _id,
-    "prediction": int(pipeline.predict(obs)[0]),
-    "proba": proba
-    }
-    
     p = Prediction(
-        observation_id=_id,
-        proba=proba,
-        observation=json.dumps(observation)
+        observation_id=str(observation_id),
+        observation=json.dumps(observation),
+        prediction=int(prediction),
+        proba=probability
     )
+
     try:
         p.save()
     except IntegrityError:
-        error_msg = f'Observation ID {_id} already exists'
-        response['error'] = error_msg
-        print(error_msg)
-    return jsonify(response)
+        return jsonify({
+            "observation_id": observation_id,
+            "error": f"Observation ID {observation_id} already exists"
+        }), 409
+
+    response = {
+        "observation_id": observation_id,
+        "prediction": prediction,
+        "probability": probability
+    }
+
+    return jsonify(response), 200
 
 
-@app.route('/update', methods=['POST'])
+@app.route("/update", methods=["POST"])
 def update():
-    obs = request.get_json()
+    obs = request.get_json(silent=True)
+
+    if not isinstance(obs, dict):
+        return jsonify({"error": "Invalid JSON payload"}), 400
+
+    if "observation_id" not in obs:
+        return jsonify({"error": "Missing field: observation_id"}), 400
+
+    if "true_class" not in obs:
+        return jsonify({
+            "observation_id": obs.get("observation_id"),
+            "error": "Missing field: true_class"
+        }), 400
+
+    observation_id = str(obs["observation_id"])
+
     try:
-        p = Prediction.get(Prediction.observation_id == obs['id'])
-        p.true_class = obs['true_class']
+        p = Prediction.get(Prediction.observation_id == observation_id)
+        p.true_class = int(obs["true_class"])
         p.save()
-        return jsonify(model_to_dict(p))
+        return jsonify(model_to_dict(p)), 200
+    except ValueError:
+        return jsonify({
+            "observation_id": observation_id,
+            "error": "true_class must be numeric"
+        }), 400
     except Prediction.DoesNotExist:
-        error_msg = f"Observation ID {obs['id']} does not exist"
-        return jsonify({'error': error_msg})
+        return jsonify({
+            "observation_id": observation_id,
+            "error": f"Observation ID {observation_id} does not exist"
+        }), 404
 
 
-@app.route('/list-db-contents')
+@app.route("/list-db-contents", methods=["GET"])
 def list_db_contents():
     return jsonify([
         model_to_dict(obs) for obs in Prediction.select()
-    ])
+    ]), 200
 
 
 # End webserver stuff
 ########################################
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', debug=True, port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", debug=False, port=port)
