@@ -74,7 +74,12 @@ def predict():
     except Exception:
         return jsonify({"error": "Observation is invalid!"})
 
-    response = {'proba': proba}
+    response = {
+    "id": _id,
+    "prediction": int(pipeline.predict(obs)[0]),
+    "proba": proba
+    }
+    
     p = Prediction(
         observation_id=_id,
         proba=proba,
