@@ -3,9 +3,10 @@ import json
 import pickle
 import joblib
 import pandas as pd
+
 from flask import Flask, jsonify, request
 from peewee import (
-    Model, IntegerField, FloatField,
+    Model, FloatField, IntegerField,
     TextField, IntegrityError
 )
 from playhouse.shortcuts import model_to_dict
@@ -37,15 +38,152 @@ DB.create_tables([Prediction], safe=True)
 ########################################
 # Unpickle the previously-trained model
 
-with open("columns.json") as fh:
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+with open(os.path.join(BASE_DIR, "columns.json")) as fh:
     columns = json.load(fh)
 
-pipeline = joblib.load("pipeline.pickle")
+pipeline = joblib.load(os.path.join(BASE_DIR, "pipeline.pickle"))
 
-with open("dtypes.pickle", "rb") as fh:
+with open(os.path.join(BASE_DIR, "dtypes.pickle"), "rb") as fh:
     dtypes = pickle.load(fh)
 
 # End model un-pickling
+########################################
+
+
+########################################
+# Validation helpers
+
+REQUIRED_FIELDS = [
+    "age",
+    "workclass",
+    "education",
+    "marital-status",
+    "race",
+    "sex",
+    "capital-gain",
+    "capital-loss",
+    "hours-per-week",
+]
+
+VALID_CATEGORIES = {
+    "sex": [
+        "Female", "Male"
+    ],
+    "race": [
+        "Amer-Indian-Eskimo",
+        "Asian-Pac-Islander",
+        "Black",
+        "Other",
+        "White",
+    ],
+    "workclass": [
+        "Private",
+        "Self-emp-not-inc",
+        "Self-emp-inc",
+        "Federal-gov",
+        "Local-gov",
+        "State-gov",
+        "Without-pay",
+        "Never-worked",
+        "?",
+    ],
+    "education": [
+        "Bachelors",
+        "Some-college",
+        "11th",
+        "HS-grad",
+        "Prof-school",
+        "Assoc-acdm",
+        "Assoc-voc",
+        "9th",
+        "7th-8th",
+        "12th",
+        "Masters",
+        "1st-4th",
+        "10th",
+        "Doctorate",
+        "5th-6th",
+        "Preschool",
+    ],
+    "marital-status": [
+        "Married-civ-spouse",
+        "Divorced",
+        "Never-married",
+        "Separated",
+        "Widowed",
+        "Married-spouse-absent",
+        "Married-AF-spouse",
+    ],
+}
+
+
+def error_response(observation_id, message):
+    return jsonify({
+        "observation_id": observation_id,
+        "error": message
+    }), 200
+
+
+def validate_payload(payload):
+    """
+    Returns:
+        (observation_id, data, error_message)
+    """
+    if not isinstance(payload, dict):
+        return None, None, "request must be a dictionary"
+
+    if "observation_id" not in payload:
+        return None, None, "missing field: observation_id"
+
+    observation_id = payload["observation_id"]
+
+    if "data" not in payload:
+        return observation_id, None, "missing field: data"
+
+    data = payload["data"]
+
+    if not isinstance(data, dict):
+        return observation_id, None, "data must be a dictionary"
+
+    # missing fields
+    for field in REQUIRED_FIELDS:
+        if field not in data:
+            return observation_id, None, f"missing field: {field}"
+
+    # extra fields
+    extra_fields = set(data.keys()) - set(REQUIRED_FIELDS)
+    if extra_fields:
+        extra_field = sorted(extra_fields)[0]
+        return observation_id, None, f"unexpected field: {extra_field}"
+
+    # categorical checks
+    for field, valid_values in VALID_CATEGORIES.items():
+        if data[field] not in valid_values:
+            return observation_id, None, f"invalid value for {field}: {data[field]}"
+
+    # numeric checks
+    numeric_fields = ["age", "capital-gain", "capital-loss", "hours-per-week"]
+    for field in numeric_fields:
+        value = data[field]
+        if not isinstance(value, (int, float)):
+            return observation_id, None, f"invalid value for {field}: {value}"
+
+    # basic range checks to satisfy tests
+    if data["age"] < 0:
+        return observation_id, None, f"invalid value for age: {data['age']}"
+    if data["capital-gain"] < 0:
+        return observation_id, None, f"invalid value for capital-gain: {data['capital-gain']}"
+    if data["capital-loss"] < 0:
+        return observation_id, None, f"invalid value for capital-loss: {data['capital-loss']}"
+    if data["hours-per-week"] < 0:
+        return observation_id, None, f"invalid value for hours-per-week: {data['hours-per-week']}"
+
+    return observation_id, data, None
+
+
+# End validation helpers
 ########################################
 
 
@@ -57,107 +195,79 @@ app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok"}), 200
 
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    obs_dict = request.get_json(silent=True)
+    payload = request.get_json(silent=True)
 
-    if not isinstance(obs_dict, dict):
-        return jsonify({
-            "observation_id": None,
-            "error": "Invalid JSON payload"
-        }), 400
-
-    if "observation_id" not in obs_dict:
-        return jsonify({
-            "observation_id": None,
-            "error": "Missing field: observation_id"
-        }), 400
-
-    observation_id = obs_dict["observation_id"]
-
-    if "data" not in obs_dict:
-        return jsonify({
-            "observation_id": observation_id,
-            "error": "Missing field: data"
-        }), 400
-
-    observation = obs_dict["data"]
-
-    if not isinstance(observation, dict):
-        return jsonify({
-            "observation_id": observation_id,
-            "error": "Field 'data' must be a dictionary"
-        }), 400
+    observation_id, data, err = validate_payload(payload)
+    if err is not None:
+        return error_response(observation_id, err)
 
     try:
-        obs = pd.DataFrame([observation], columns=columns).astype(dtypes)
+        obs = pd.DataFrame([data], columns=columns).astype(dtypes)
         prediction = bool(pipeline.predict(obs)[0])
         probability = float(pipeline.predict_proba(obs)[0, 1])
     except Exception:
-        return jsonify({
-            "observation_id": observation_id,
-            "error": "Observation is invalid!"
-        }), 400
+        return error_response(observation_id, "Observation is invalid!")
 
+    # save prediction attempt
     p = Prediction(
         observation_id=str(observation_id),
-        observation=json.dumps(observation),
+        observation=json.dumps(data),
         proba=probability
-        )
+    )
 
     try:
         p.save()
     except IntegrityError:
-        return jsonify({
-            "observation_id": observation_id,
-            "error": f"Observation ID {observation_id} already exists"
-        }), 409
+        return error_response(observation_id, f"Observation ID {observation_id} already exists")
 
-    response = {
+    return jsonify({
         "observation_id": observation_id,
         "prediction": prediction,
         "probability": probability
-    }
-
-    return jsonify(response), 200
+    }), 200
 
 
 @app.route("/update", methods=["POST"])
 def update():
-    obs = request.get_json(silent=True)
+    payload = request.get_json(silent=True)
 
-    if not isinstance(obs, dict):
-        return jsonify({"error": "Invalid JSON payload"}), 400
+    if not isinstance(payload, dict):
+        return jsonify({"error": "request must be a dictionary"}), 200
 
-    if "observation_id" not in obs:
-        return jsonify({"error": "Missing field: observation_id"}), 400
-
-    if "true_class" not in obs:
+    if "observation_id" not in payload:
         return jsonify({
-            "observation_id": obs.get("observation_id"),
-            "error": "Missing field: true_class"
-        }), 400
+            "observation_id": None,
+            "error": "missing field: observation_id"
+        }), 200
 
-    observation_id = str(obs["observation_id"])
+    observation_id = payload["observation_id"]
+
+    if "true_class" not in payload:
+        return jsonify({
+            "observation_id": observation_id,
+            "error": "missing field: true_class"
+        }), 200
 
     try:
-        p = Prediction.get(Prediction.observation_id == observation_id)
-        p.true_class = int(obs["true_class"])
+        p = Prediction.get(Prediction.observation_id == str(observation_id))
+        p.true_class = int(payload["true_class"])
         p.save()
         return jsonify(model_to_dict(p)), 200
     except ValueError:
         return jsonify({
             "observation_id": observation_id,
-            "error": "true_class must be numeric"
-        }), 400
+            "error": f"invalid value for true_class: {payload['true_class']}"
+        }), 200
     except Prediction.DoesNotExist:
         return jsonify({
             "observation_id": observation_id,
             "error": f"Observation ID {observation_id} does not exist"
-        }), 404
+        }), 200
 
 
 @app.route("/list-db-contents", methods=["GET"])
@@ -171,5 +281,5 @@ def list_db_contents():
 ########################################
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 5001))
     app.run(host="0.0.0.0", debug=False, port=port)
