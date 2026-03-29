@@ -4,9 +4,33 @@ import numpy as np
 import pandas as pd
 from flask import Flask, request, jsonify
 
+from peewee import Model, IntegerField, CharField, FloatField, SqliteDatabase
+from playhouse.db_url import connect
+
+
 app = Flask(__name__)
 
-# Load model package
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+if DATABASE_URL:
+    db = connect(DATABASE_URL)
+else:
+    db = SqliteDatabase("updates.db")
+
+
+class BaseModel(Model):
+    class Meta:
+        database = db
+
+
+class GroundTruthUpdate(BaseModel):
+    date_str = CharField()
+    port_code = IntegerField()
+    traffic = CharField()
+    true_value = FloatField()
+
+
 MODEL_PATH = "model_package.pkl"
 model_package = joblib.load(MODEL_PATH)
 
@@ -31,16 +55,37 @@ def make_feature_row(port_code, traffic, date_value, lag_1, lag_2, lag_3):
     }])
 
 
+def load_updates_from_db():
+    global last_train_date
+
+    query = GroundTruthUpdate.select().order_by(GroundTruthUpdate.id)
+
+    for row in query:
+        key = (row.port_code, row.traffic)
+
+        if key not in history_store:
+            history_store[key] = []
+
+        history_store[key].append(row.true_value)
+
+        if len(history_store[key]) > 3:
+            history_store[key] = history_store[key][-3:]
+
+        row_date = pd.to_datetime(row.date_str, format="%b %Y")
+        if row_date > last_train_date:
+            last_train_date = row_date
+
+
 def recursive_forecast(port_code, traffic):
     key = (int(port_code), traffic)
 
     if key not in history_store:
-        return {"error": "No history for this port_code and traffic"}
+        return {"error": "No history for this port_code and traffic"}, 422
 
     history = history_store[key].copy()
 
     if len(history) < 3:
-        return {"error": "Not enough history"}
+        return {"error": f"Not enough history for port_code={port_code} and traffic='{traffic}'"}, 422
 
     future_dates = pd.date_range(
         start=last_train_date + pd.DateOffset(months=1),
@@ -56,12 +101,12 @@ def recursive_forecast(port_code, traffic):
         lag_3 = history[-3]
 
         X = make_feature_row(
-            port_code,
-            traffic,
-            future_date,
-            lag_1,
-            lag_2,
-            lag_3
+            port_code=port_code,
+            traffic=traffic,
+            date_value=future_date,
+            lag_1=lag_1,
+            lag_2=lag_2,
+            lag_3=lag_3
         )
 
         pred = pipeline.predict(X)[0]
@@ -74,7 +119,12 @@ def recursive_forecast(port_code, traffic):
         "port_code": int(port_code),
         "traffic": traffic,
         "prediction": " ".join(map(str, predictions))
-    }
+    }, 200
+
+
+db.connect(reuse_if_open=True)
+db.create_tables([GroundTruthUpdate])
+load_updates_from_db()
 
 
 @app.route("/")
@@ -87,24 +137,26 @@ def predict():
     data = request.get_json()
 
     if not data:
-        return jsonify({"error": "No JSON provided"}), 400
+        return jsonify({"error": "No JSON provided"}), 422
 
     if "port_code" not in data or "traffic" not in data:
-        return jsonify({"error": "port_code and traffic required"}), 400
+        return jsonify({"error": "port_code and traffic required"}), 422
 
     try:
         port_code = int(data["port_code"])
-    except:
-        return jsonify({"error": "port_code must be int"}), 400
+    except Exception:
+        return jsonify({"error": "port_code must be int"}), 422
 
     traffic = data["traffic"]
 
+    if not isinstance(traffic, str):
+        return jsonify({"error": "traffic must be string"}), 422
+
     if traffic not in traffic_values:
-        return jsonify({"error": f"traffic must be one of {traffic_values}"}), 400
+        return jsonify({"error": f"traffic must be one of {traffic_values}"}), 422
 
-    result = recursive_forecast(port_code, traffic)
-
-    return jsonify(result)
+    result, status_code = recursive_forecast(port_code, traffic)
+    return jsonify(result), status_code
 
 
 @app.route("/update", methods=["POST"])
@@ -114,15 +166,31 @@ def update():
     data = request.get_json()
 
     required = ["date", "port_code", "traffic", "true_value"]
-    if not all(k in data for k in required):
-        return jsonify({"error": "Missing fields"}), 400
+    if not data or not all(k in data for k in required):
+        return jsonify({"error": "Missing fields"}), 422
 
     date = data["date"]
-    date_parsed = pd.to_datetime(date, format="%b %Y")
 
-    port_code = int(data["port_code"])
+    try:
+        date_parsed = pd.to_datetime(date, format="%b %Y")
+    except Exception:
+        return jsonify({"error": "date must have format like 'Sep 2025'"}), 422
+
+    try:
+        port_code = int(data["port_code"])
+    except Exception:
+        return jsonify({"error": "port_code must be int"}), 422
+
     traffic = data["traffic"]
-    value = data["true_value"]
+    if not isinstance(traffic, str):
+        return jsonify({"error": "traffic must be string"}), 422
+
+    true_value_raw = data["true_value"]
+
+    try:
+        value = float(true_value_raw)
+    except Exception:
+        return jsonify({"error": "true_value must be numeric"}), 422
 
     key = (port_code, traffic)
 
@@ -131,15 +199,26 @@ def update():
 
     history_store[key].append(value)
 
+    if len(history_store[key]) > 3:
+        history_store[key] = history_store[key][-3:]
+
     if date_parsed > last_train_date:
         last_train_date = date_parsed
+
+    GroundTruthUpdate.create(
+        date_str=date,
+        port_code=port_code,
+        traffic=traffic,
+        true_value=value
+    )
 
     return jsonify({
         "date": date,
         "port_code": port_code,
         "traffic": traffic,
-        "true_value": value
-    })
+        "true_value": true_value_raw
+    }), 200
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
