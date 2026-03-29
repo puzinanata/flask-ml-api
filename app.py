@@ -11,6 +11,10 @@ from playhouse.db_url import connect
 app = Flask(__name__)
 
 
+# =========================================================
+# DATABASE
+# =========================================================
+
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 if DATABASE_URL:
@@ -31,6 +35,10 @@ class GroundTruthUpdate(BaseModel):
     true_value = FloatField()
 
 
+# =========================================================
+# LOAD MODEL
+# =========================================================
+
 MODEL_PATH = "model_package.pkl"
 model_package = joblib.load(MODEL_PATH)
 
@@ -39,6 +47,10 @@ history_store = model_package["history_store"]
 last_train_date = pd.Timestamp(model_package["last_train_date"])
 traffic_values = model_package["traffic_values"]
 
+
+# =========================================================
+# HELPERS
+# =========================================================
 
 def make_feature_row(port_code, traffic, date_value, lag_1, lag_2, lag_3):
     month = date_value.month
@@ -72,6 +84,7 @@ def load_updates_from_db():
             history_store[key] = history_store[key][-3:]
 
         row_date = pd.to_datetime(row.date_str, format="%b %Y")
+
         if row_date > last_train_date:
             last_train_date = row_date
 
@@ -122,16 +135,27 @@ def recursive_forecast(port_code, traffic):
     }, 200
 
 
+# =========================================================
+# INIT DB
+# =========================================================
+
 db.connect(reuse_if_open=True)
 db.create_tables([GroundTruthUpdate])
 load_updates_from_db()
 
+
+# =========================================================
+# ROUTES
+# =========================================================
 
 @app.route("/")
 def home():
     return "API is running"
 
 
+# ---------------------------
+# PREDICT
+# ---------------------------
 @app.route("/predict", methods=["POST"])
 def predict():
     data = request.get_json()
@@ -159,6 +183,9 @@ def predict():
     return jsonify(result), status_code
 
 
+# ---------------------------
+# UPDATE (IMPORTANT PART)
+# ---------------------------
 @app.route("/update", methods=["POST"])
 def update():
     global last_train_date
@@ -166,34 +193,40 @@ def update():
     data = request.get_json()
 
     required = ["date", "port_code", "traffic", "true_value"]
+
     if not data or not all(k in data for k in required):
         return jsonify({"error": "Missing fields"}), 422
 
-    date = data["date"]
-
+    # ---- date ----
     try:
-        date_parsed = pd.to_datetime(date, format="%b %Y")
+        date_parsed = pd.to_datetime(data["date"], format="%b %Y")
     except Exception:
-        return jsonify({"error": "date must have format like 'Sep 2025'"}), 422
+        return jsonify({"error": "date must be like 'Sep 2025'"}), 422
 
+    # ---- port_code ----
     try:
         port_code = int(data["port_code"])
     except Exception:
         return jsonify({"error": "port_code must be int"}), 422
 
+    # ---- traffic ----
     traffic = data["traffic"]
+
     if not isinstance(traffic, str):
         return jsonify({"error": "traffic must be string"}), 422
 
-    true_value_raw = data["true_value"]
+    if traffic not in traffic_values:
+        return jsonify({"error": f"traffic must be one of {traffic_values}"}), 422
 
+    # ---- true_value ----
     try:
-        value = float(true_value_raw)
+        value = float(data["true_value"])
     except Exception:
         return jsonify({"error": "true_value must be numeric"}), 422
 
     key = (port_code, traffic)
 
+    # ---- update in-memory history ----
     if key not in history_store:
         history_store[key] = []
 
@@ -205,20 +238,35 @@ def update():
     if date_parsed > last_train_date:
         last_train_date = date_parsed
 
-    GroundTruthUpdate.create(
-        date_str=date,
-        port_code=port_code,
-        traffic=traffic,
-        true_value=value
+    # ---- store in DB (IMPORTANT FIX: avoid duplicates) ----
+    existing = GroundTruthUpdate.get_or_none(
+        (GroundTruthUpdate.date_str == data["date"]) &
+        (GroundTruthUpdate.port_code == port_code) &
+        (GroundTruthUpdate.traffic == traffic)
     )
 
+    if existing:
+        existing.true_value = value
+        existing.save()
+    else:
+        GroundTruthUpdate.create(
+            date_str=data["date"],
+            port_code=port_code,
+            traffic=traffic,
+            true_value=value
+        )
+
     return jsonify({
-        "date": date,
+        "date": data["date"],
         "port_code": port_code,
         "traffic": traffic,
-        "true_value": true_value_raw
+        "true_value": value
     }), 200
 
+
+# =========================================================
+# MAIN
+# =========================================================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
