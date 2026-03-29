@@ -122,7 +122,7 @@ def update():
 
     port_code = int(data["port_code"])
     traffic = data["traffic"]
-    value = data["true_value"]
+    value = float(data["true_value"])
 
     key = (port_code, traffic)
 
