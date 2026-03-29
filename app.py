@@ -1,285 +1,146 @@
 import os
-import json
-import pickle
 import joblib
+import numpy as np
 import pandas as pd
-
-from flask import Flask, jsonify, request
-from peewee import (
-    Model, FloatField, IntegerField,
-    TextField, IntegrityError
-)
-from playhouse.shortcuts import model_to_dict
-from playhouse.db_url import connect
-
-
-########################################
-# Begin database stuff
-
-DB = connect(os.environ.get("DATABASE_URL") or "sqlite:///predictions.db")
-
-
-class Prediction(Model):
-    observation_id = TextField(unique=True)
-    observation = TextField()
-    proba = FloatField()
-    true_class = IntegerField(null=True)
-
-    class Meta:
-        database = DB
-
-
-DB.connect(reuse_if_open=True)
-DB.create_tables([Prediction], safe=True)
-
-# End database stuff
-########################################
-
-########################################
-# Unpickle the previously-trained model
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-with open(os.path.join(BASE_DIR, "columns.json")) as fh:
-    columns = json.load(fh)
-
-pipeline = joblib.load(os.path.join(BASE_DIR, "pipeline.pickle"))
-
-with open(os.path.join(BASE_DIR, "dtypes.pickle"), "rb") as fh:
-    dtypes = pickle.load(fh)
-
-# End model un-pickling
-########################################
-
-
-########################################
-# Validation helpers
-
-REQUIRED_FIELDS = [
-    "age",
-    "workclass",
-    "education",
-    "marital-status",
-    "race",
-    "sex",
-    "capital-gain",
-    "capital-loss",
-    "hours-per-week",
-]
-
-VALID_CATEGORIES = {
-    "sex": [
-        "Female", "Male"
-    ],
-    "race": [
-        "Amer-Indian-Eskimo",
-        "Asian-Pac-Islander",
-        "Black",
-        "Other",
-        "White",
-    ],
-    "workclass": [
-        "Private",
-        "Self-emp-not-inc",
-        "Self-emp-inc",
-        "Federal-gov",
-        "Local-gov",
-        "State-gov",
-        "Without-pay",
-        "Never-worked",
-        "?",
-    ],
-    "education": [
-        "Bachelors",
-        "Some-college",
-        "11th",
-        "HS-grad",
-        "Prof-school",
-        "Assoc-acdm",
-        "Assoc-voc",
-        "9th",
-        "7th-8th",
-        "12th",
-        "Masters",
-        "1st-4th",
-        "10th",
-        "Doctorate",
-        "5th-6th",
-        "Preschool",
-    ],
-    "marital-status": [
-        "Married-civ-spouse",
-        "Divorced",
-        "Never-married",
-        "Separated",
-        "Widowed",
-        "Married-spouse-absent",
-        "Married-AF-spouse",
-    ],
-}
-
-
-def error_response(observation_id, message):
-    return jsonify({
-        "observation_id": observation_id,
-        "error": message
-    }), 200
-
-
-def validate_payload(payload):
-    """
-    Returns:
-        (observation_id, data, error_message)
-    """
-    if not isinstance(payload, dict):
-        return None, None, "request must be a dictionary"
-
-    if "observation_id" not in payload:
-        return None, None, "missing field: observation_id"
-
-    observation_id = payload["observation_id"]
-
-    if "data" not in payload:
-        return observation_id, None, "missing field: data"
-
-    data = payload["data"]
-
-    if not isinstance(data, dict):
-        return observation_id, None, "data must be a dictionary"
-
-    # missing fields
-    for field in REQUIRED_FIELDS:
-        if field not in data:
-            return observation_id, None, f"missing field: {field}"
-
-    # extra fields
-    extra_fields = set(data.keys()) - set(REQUIRED_FIELDS)
-    if extra_fields:
-        extra_field = sorted(extra_fields)[0]
-        return observation_id, None, f"unexpected field: {extra_field}"
-
-    # categorical checks
-    for field, valid_values in VALID_CATEGORIES.items():
-        if data[field] not in valid_values:
-            return observation_id, None, f"invalid value for {field}: {data[field]}"
-
-    # numeric checks
-    numeric_fields = ["age", "capital-gain", "capital-loss", "hours-per-week"]
-    for field in numeric_fields:
-        value = data[field]
-        if not isinstance(value, (int, float)):
-            return observation_id, None, f"invalid value for {field}: {value}"
-
-    # basic range checks to satisfy tests
-    if data["age"] < 0:
-        return observation_id, None, f"invalid value for age: {data['age']}"
-    if data["capital-gain"] < 0:
-        return observation_id, None, f"invalid value for capital-gain: {data['capital-gain']}"
-    if data["capital-loss"] < 0:
-        return observation_id, None, f"invalid value for capital-loss: {data['capital-loss']}"
-    if data["hours-per-week"] < 0:
-        return observation_id, None, f"invalid value for hours-per-week: {data['hours-per-week']}"
-
-    return observation_id, data, None
-
-
-# End validation helpers
-########################################
-
-
-########################################
-# Begin webserver stuff
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
+# Load model package
+MODEL_PATH = "model_package.pkl"
+model_package = joblib.load(MODEL_PATH)
 
-@app.route("/", methods=["GET"])
+pipeline = model_package["pipeline"]
+history_store = model_package["history_store"]
+last_train_date = pd.Timestamp(model_package["last_train_date"])
+traffic_values = model_package["traffic_values"]
+
+
+def make_feature_row(port_code, traffic, date_value, lag_1, lag_2, lag_3):
+    month = date_value.month
+
+    return pd.DataFrame([{
+        "Code": int(port_code),
+        "traffic": traffic,
+        "year": date_value.year,
+        "sin_month": np.sin(2 * np.pi * month / 12),
+        "cos_month": np.cos(2 * np.pi * month / 12),
+        "lag_1": lag_1,
+        "lag_2": lag_2,
+        "lag_3": lag_3
+    }])
+
+
+def recursive_forecast(port_code, traffic):
+    key = (int(port_code), traffic)
+
+    if key not in history_store:
+        return {"error": "No history for this port_code and traffic"}
+
+    history = history_store[key].copy()
+
+    if len(history) < 3:
+        return {"error": "Not enough history"}
+
+    future_dates = pd.date_range(
+        start=last_train_date + pd.DateOffset(months=1),
+        periods=6,
+        freq="MS"
+    )
+
+    predictions = []
+
+    for future_date in future_dates:
+        lag_1 = history[-1]
+        lag_2 = history[-2]
+        lag_3 = history[-3]
+
+        X = make_feature_row(
+            port_code,
+            traffic,
+            future_date,
+            lag_1,
+            lag_2,
+            lag_3
+        )
+
+        pred = pipeline.predict(X)[0]
+        pred = int(round(max(0, pred)))
+
+        predictions.append(pred)
+        history.append(pred)
+
+    return {
+        "port_code": int(port_code),
+        "traffic": traffic,
+        "prediction": " ".join(map(str, predictions))
+    }
+
+
+@app.route("/")
 def home():
-    return jsonify({"status": "ok"}), 200
+    return "API is running"
 
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    payload = request.get_json(silent=True)
+    data = request.get_json()
 
-    observation_id, data, err = validate_payload(payload)
-    if err is not None:
-        return error_response(observation_id, err)
+    if not data:
+        return jsonify({"error": "No JSON provided"}), 400
 
-    try:
-        obs = pd.DataFrame([data], columns=columns).astype(dtypes)
-        prediction = bool(pipeline.predict(obs)[0])
-        probability = float(pipeline.predict_proba(obs)[0, 1])
-    except Exception:
-        return error_response(observation_id, "Observation is invalid!")
-
-    # save prediction attempt
-    p = Prediction(
-        observation_id=str(observation_id),
-        observation=json.dumps(data),
-        proba=probability
-    )
+    if "port_code" not in data or "traffic" not in data:
+        return jsonify({"error": "port_code and traffic required"}), 400
 
     try:
-        p.save()
-    except IntegrityError:
-        return error_response(observation_id, f"Observation ID {observation_id} already exists")
+        port_code = int(data["port_code"])
+    except:
+        return jsonify({"error": "port_code must be int"}), 400
 
-    return jsonify({
-        "observation_id": observation_id,
-        "prediction": prediction,
-        "probability": probability
-    }), 200
+    traffic = data["traffic"]
+
+    if traffic not in traffic_values:
+        return jsonify({"error": f"traffic must be one of {traffic_values}"}), 400
+
+    result = recursive_forecast(port_code, traffic)
+
+    return jsonify(result)
 
 
 @app.route("/update", methods=["POST"])
 def update():
-    payload = request.get_json(silent=True)
+    global last_train_date
 
-    if not isinstance(payload, dict):
-        return jsonify({"error": "request must be a dictionary"}), 200
+    data = request.get_json()
 
-    if "observation_id" not in payload:
-        return jsonify({
-            "observation_id": None,
-            "error": "missing field: observation_id"
-        }), 200
+    required = ["date", "port_code", "traffic", "true_value"]
+    if not all(k in data for k in required):
+        return jsonify({"error": "Missing fields"}), 400
 
-    observation_id = payload["observation_id"]
+    date = data["date"]
+    date_parsed = pd.to_datetime(date, format="%b %Y")
 
-    if "true_class" not in payload:
-        return jsonify({
-            "observation_id": observation_id,
-            "error": "missing field: true_class"
-        }), 200
+    port_code = int(data["port_code"])
+    traffic = data["traffic"]
+    value = float(data["true_value"])
 
-    try:
-        p = Prediction.get(Prediction.observation_id == str(observation_id))
-        p.true_class = int(payload["true_class"])
-        p.save()
-        return jsonify(model_to_dict(p)), 200
-    except ValueError:
-        return jsonify({
-            "observation_id": observation_id,
-            "error": f"invalid value for true_class: {payload['true_class']}"
-        }), 200
-    except Prediction.DoesNotExist:
-        return jsonify({
-            "observation_id": observation_id,
-            "error": f"Observation ID {observation_id} does not exist"
-        }), 200
+    key = (port_code, traffic)
 
+    if key not in history_store:
+        history_store[key] = []
 
-@app.route("/list-db-contents", methods=["GET"])
-def list_db_contents():
-    return jsonify([
-        model_to_dict(obs) for obs in Prediction.select()
-    ]), 200
+    history_store[key].append(value)
 
+    if date_parsed > last_train_date:
+        last_train_date = date_parsed
 
-# End webserver stuff
-########################################
+    return jsonify({
+        "date": date,
+        "port_code": port_code,
+        "traffic": traffic,
+        "true_value": value
+    })
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5001))
-    app.run(host="0.0.0.0", debug=False, port=port)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)

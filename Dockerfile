@@ -1,8 +1,13 @@
 FROM python:3.12
 
-ADD . /opt/ml_in_app
-WORKDIR /opt/ml_in_app
+WORKDIR /app
 
-# install packages by conda
-RUN pip install -r requirements_prod.txt
+# install dependencies first (better caching)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# copy all project files
+COPY . .
+
+# run app
 CMD ["python", "app.py"]
