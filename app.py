@@ -140,7 +140,7 @@ def recursive_forecast(port_code, traffic):
 # =========================================================
 
 db.connect(reuse_if_open=True)
-db.create_tables([GroundTruthUpdate])
+db.create_tables([GroundTruthUpdate], safe=True)
 load_updates_from_db()
 
 
@@ -184,7 +184,7 @@ def predict():
 
 
 # ---------------------------
-# UPDATE (IMPORTANT PART)
+# UPDATE
 # ---------------------------
 @app.route("/update", methods=["POST"])
 def update():
@@ -197,19 +197,16 @@ def update():
     if not data or not all(k in data for k in required):
         return jsonify({"error": "Missing fields"}), 422
 
-    # ---- date ----
     try:
         date_parsed = pd.to_datetime(data["date"], format="%b %Y")
     except Exception:
         return jsonify({"error": "date must be like 'Sep 2025'"}), 422
 
-    # ---- port_code ----
     try:
         port_code = int(data["port_code"])
     except Exception:
         return jsonify({"error": "port_code must be int"}), 422
 
-    # ---- traffic ----
     traffic = data["traffic"]
 
     if not isinstance(traffic, str):
@@ -218,7 +215,6 @@ def update():
     if traffic not in traffic_values:
         return jsonify({"error": f"traffic must be one of {traffic_values}"}), 422
 
-    # ---- true_value ----
     try:
         value = float(data["true_value"])
     except Exception:
@@ -226,7 +222,6 @@ def update():
 
     key = (port_code, traffic)
 
-    # ---- update in-memory history ----
     if key not in history_store:
         history_store[key] = []
 
@@ -238,7 +233,6 @@ def update():
     if date_parsed > last_train_date:
         last_train_date = date_parsed
 
-    # ---- store in DB (IMPORTANT FIX: avoid duplicates) ----
     existing = GroundTruthUpdate.get_or_none(
         (GroundTruthUpdate.date_str == data["date"]) &
         (GroundTruthUpdate.port_code == port_code) &
@@ -262,6 +256,26 @@ def update():
         "traffic": traffic,
         "true_value": value
     }), 200
+
+
+# ---------------------------
+# LIST DB CONTENTS
+# ---------------------------
+@app.route("/list-db-contents", methods=["GET"])
+def list_db_contents():
+    rows = []
+    query = GroundTruthUpdate.select().order_by(GroundTruthUpdate.id)
+
+    for row in query:
+        rows.append({
+            "id": row.id,
+            "date": row.date_str,
+            "port_code": row.port_code,
+            "traffic": row.traffic,
+            "true_value": row.true_value
+        })
+
+    return jsonify(rows), 200
 
 
 # =========================================================
