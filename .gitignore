@@ -4,8 +4,20 @@ __pycache__/
 venv/
 .prod/
 .DS_Store
-*.pkl
 *.joblib
 models/
 data/
 notes.txt
+# Python
+__pycache__/
+.ipynb_checkpoints/
+
+# Local database
+predictions.db
+
+# Virtual env
+.venv/
+venv/
+
+# Mac
+.DS_Store

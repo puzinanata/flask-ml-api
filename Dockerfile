@@ -1,13 +1,13 @@
-FROM python:3.12
+FROM python:3.12-slim
 
 WORKDIR /app
 
-# install dependencies first (better caching)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install production dependencies first
+COPY requirements_prod.txt .
+RUN pip install --no-cache-dir -r requirements_prod.txt
 
-# copy all project files
+# Copy app files
 COPY . .
 
-# run app
-CMD ["python", "app.py"]
+# Railway provides PORT automatically
+CMD gunicorn app:app --bind 0.0.0.0:${PORT:-5000}

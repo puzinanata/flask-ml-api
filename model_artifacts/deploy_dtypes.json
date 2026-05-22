@@ -1,0 +1,12 @@
+{
+    "call_type": "object",
+    "call_type_group": "object",
+    "original_priority": "object",
+    "unit_id": "object",
+    "unit_type": "object",
+    "station_area": "float64",
+    "battalion": "object",
+    "neighborhood_district": "object",
+    "zipcode_of_incident": "float64",
+    "received_dttm": "datetime64[ns]"
+}

@@ -1,0 +1,12 @@
+[
+    "call_type",
+    "call_type_group",
+    "original_priority",
+    "unit_id",
+    "unit_type",
+    "station_area",
+    "battalion",
+    "neighborhood_district",
+    "zipcode_of_incident",
+    "received_dttm"
+]
