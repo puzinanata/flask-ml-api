@@ -1,6 +1,8 @@
 import json
 import os
 from pathlib import Path
+import logging
+from urllib import response
 
 import joblib
 import pandas as pd
@@ -13,6 +15,8 @@ from peewee import (
 )
 from playhouse.db_url import connect
 
+
+request_counter = 0
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_DIR = BASE_DIR / "model_artifacts"
@@ -67,6 +71,18 @@ DB.create_tables([ResponsePrediction], safe=True)
 
 app = Flask(__name__)
 
+LOG_FILE = "app.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+
+app.logger.setLevel(logging.INFO)
 
 def make_error(message, status_code=422):
     return jsonify({"error": message}), status_code
@@ -104,6 +120,7 @@ def health_check():
 @app.route("/predict_response/", methods=["POST"])
 def predict_response():
     payload = request.get_json(silent=True)
+    app.logger.info(f"PREDICT REQUEST RECEIVED: {payload}")
 
     if not validate_required_fields(payload, raw_columns):
         return make_error("Incorrectly formatted input data.")
@@ -118,6 +135,7 @@ def predict_response():
         obs = build_observation(payload)
         prediction = float(pipeline.predict(obs)[0])
     except Exception as e:
+        app.logger.exception("PREDICTION FAILED")
         return make_error(f"Prediction failed: {str(e)}")
 
     record = ResponsePrediction(
@@ -129,20 +147,43 @@ def predict_response():
 
     try:
         record.save()
+
+        app.logger.info(
+            f"NEW PREDICTION SAVED: "
+            f"{payload['unit_id']} | {received_dttm}"
+        )
+
+        return jsonify({
+            "unit_id": str(payload["unit_id"]),
+            "received_dttm": received_dttm,
+            "predicted_response_time_seconds": prediction,
+        })
+
     except IntegrityError:
         DB.rollback()
-        return make_error("This unit_id and received_dttm pair already exists.")
 
-    return jsonify({
-        "unit_id": str(payload["unit_id"]),
-        "received_dttm": received_dttm,
-        "predicted_response_time_seconds": prediction,
-    })
+        app.logger.warning(
+            f"DUPLICATE PREDICTION REQUEST: "
+            f"{payload['unit_id']} | {received_dttm}"
+        )
+
+        existing_record = ResponsePrediction.get(
+            (ResponsePrediction.unit_id == str(payload["unit_id"])) &
+            (ResponsePrediction.received_dttm == received_dttm)
+        )
+
+        return jsonify({
+            "unit_id": str(payload["unit_id"]),
+            "received_dttm": received_dttm,
+            "predicted_response_time_seconds":
+                float(existing_record.predicted_response_time_seconds),
+        })
 
 
 @app.route("/actual_response/", methods=["POST"])
 def actual_response():
     payload = request.get_json(silent=True)
+    app.logger.info(f"ACTUAL RESPONSE RECEIVED: {payload}")
 
     required_fields = ["unit_id", "received_dttm", "on_scene_dttm"]
 
@@ -169,11 +210,22 @@ def actual_response():
             (ResponsePrediction.received_dttm == received_dttm)
         )
     except ResponsePrediction.DoesNotExist:
-        return make_error("This unit_id and received_dttm pair was not found.")
+        app.logger.warning(
+            f"MISSING PREDICTION RECORD: "
+            f"{payload['unit_id']} | {received_dttm}"
+        )
+
+        return make_error(
+            "This unit_id and received_dttm pair was not found."
+        )
 
     record.on_scene_dttm = on_scene_dttm
     record.actual_response_time_seconds = float(actual_seconds)
     record.save()
+    app.logger.info(
+        f"ACTUAL RESPONSE SAVED: "
+        f"{payload['unit_id']} | {received_dttm}"
+    )
 
     return jsonify({
         "unit_id": str(payload["unit_id"]),
@@ -183,6 +235,19 @@ def actual_response():
         "predicted_response_time_seconds": float(record.predicted_response_time_seconds),
     })
 
+@app.after_request
+def log_response(response):
+    global request_counter
+
+    request_counter += 1
+
+    app.logger.info(
+        f"REQUEST_NUMBER={request_counter} "
+        f"STATUS={response.status_code} "
+        f"PATH={request.path}"
+    )
+
+    return response
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
